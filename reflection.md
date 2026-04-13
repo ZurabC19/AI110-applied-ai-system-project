@@ -4,21 +4,25 @@
 
 **a. Initial design**
 
-I designed four classes: `Task`, `Pet`, `Owner`, and `Scheduler`.
+I went with four classes: Task, Pet, Owner, and Scheduler.
 
-- `Task` holds all details about a single care activity: description, scheduled time (HH:MM), frequency (once/daily/weekly), priority, duration, due date, and completion status. It also handles creating the next recurring instance when marked complete.
-- `Pet` stores a pet's identity (name, species, breed, age) and owns a list of Task objects. It has methods to add, remove, and filter tasks.
-- `Owner` holds the owner's name and email, and maintains a list of Pet objects. It exposes a get_all_tasks() method that returns a flat list of (pet_name, task) tuples for the Scheduler to use.
-- `Scheduler` is the central class that handles all the logic: sorting tasks by time, filtering, detecting conflicts, marking tasks complete, and generating the daily plan.
+Task holds everything about a single care activity - the description, what time it's scheduled, how often it repeats, priority level, how long it takes, the date, and whether it's done. It also handles creating the next instance of itself when you mark it complete, which felt like the right place for that logic since the task already knows its own frequency.
 
-Relationships: Owner has many Pets, Pet has many Tasks, Scheduler references an Owner.
+Pet stores the basic info about the animal and keeps a list of its tasks. It has methods to add tasks, remove them, and filter for just the ones that aren't done yet.
+
+Owner holds the owner's name and email and keeps track of all their pets. It has a method that flattens everything into one list of (pet name, task) pairs so the Scheduler can work with it.
+
+Scheduler is where all the actual logic lives - sorting, filtering, conflict detection, marking things complete, and the stretch features.
+
+For the applied AI extension, I added PawPalAdvisor as a fifth component. It sits on top of the existing system and uses the Scheduler's outputs as input to a Groq API call.
 
 **b. Design changes**
 
-- Did your design change during implementation?
-- If yes, describe at least one change and why you made it.
+The main thing I changed in the original system was storing due_date as a date object instead of a string. I started with strings and immediately ran into problems when I tried to add days to them for recurrence. Switching to datetime.date with timedelta fixed that cleanly.
 
-One change was storing the due date as a datetime.date object instead of a string. This made recurrence logic using timedelta cleaner and less error-prone. I also moved recurrence logic into Task.mark_complete() rather than the Scheduler, since the task itself knows its own frequency.
+I also moved recurrence logic into Task.mark_complete() instead of the Scheduler. The task itself knows its own frequency so it made more sense there.
+
+For the advisor, the original design had the model call in a single function. I split it into three steps after realizing the grader needed to see observable intermediate state. The split also made the code easier to test since steps 1 and 2 are pure Python with no API dependency.
 
 ---
 
@@ -26,58 +30,38 @@ One change was storing the due date as a datetime.date object instead of a strin
 
 **a. Constraints and priorities**
 
-The scheduler considers three constraints: time, priority, and completion status. Tasks are sorted chronologically first, then by priority as a tiebreaker when two tasks share the same time. Completion status is used for filtering so the owner only sees what still needs to be done.
+Tasks are sorted by time first, then priority as a tiebreaker if two tasks share the same slot. I also added a weighted score that factors in duration, so longer high-priority tasks rank ahead of shorter ones within the same priority tier.
 
-Time was chosen as the primary sort key because a pet owner's day is time-structured -- they need to know when to act.
+Time is the primary sort key because a pet owner's day is time-structured - you need to know what's happening at 8am before you can think about relative priority.
 
 **b. Tradeoffs**
 
-Conflict detection only flags exact time matches -- two tasks scheduled at the same HH:MM. It does not catch overlapping durations (for example, a 60-minute task at 09:00 overlapping a task at 09:30). This is a reasonable tradeoff for a basic daily planner because it keeps the logic simple and avoids false positives on tasks that are technically close but still manageable back-to-back.
+Conflict detection only catches exact time matches. Two tasks at the same HH:MM get flagged, but a 60-minute task at 9:00 and another at 9:30 won't trigger anything even though they obviously overlap. I kept it simple because duration-aware detection would have required significantly more complexity for a feature that already does its job for the common case.
+
+The advisor uses a single model call per run rather than a chain. A more sophisticated agent would call the model at each step and let each step's output influence the next. I chose the simpler approach because the schedule data is structured enough that the retrieval step doesn't need AI to decide what to collect.
 
 ---
 
 ## 3. AI Collaboration
 
-**a. How you used AI**
+**a. How I used AI**
 
-AI was used in several phases: brainstorming the class architecture, scaffolding implementations from skeleton stubs, drafting tests, and tracing bugs. The most useful prompts were specific ones that referenced the actual file being worked on, rather than general questions.
+I used Copilot for scaffolding the original class skeletons, filling in method bodies, drafting the initial test file, and debugging session state issues in the Streamlit UI. For the advisor, I used it to draft the initial three-step structure and the Groq API call syntax.
 
-**b. Judgment and verification**
+**b. What I accepted and what I changed**
 
-When generating conflict detection logic, the AI suggested raising an exception when a conflict was found. I rejected this because a scheduling conflict is a warning, not a fatal error. Raising an exception would crash the app for something the user just needs to be notified about. I changed it to collect warnings into a list and return them so the UI can display them without breaking anything.
+Helpful suggestion I kept: the sorted() lambda key using a tuple for composite sorting. Clean and correct, adopted as-is.
 
----
+Flawed suggestion I rejected: for conflict detection, the AI suggested raising ValueError when it found a conflict. A conflict is a notification, not a crash condition. Changed to collecting warnings in a list.
 
-## 4. Testing and Verification
+Flawed suggestion I rejected: for next_available_slot(), the AI suggested a recursive function. Replaced with a flat double loop over hours and half-hours. Simpler, no stack concerns for a 28-slot window.
 
-**a. What you tested**
+Flawed suggestion I rejected: for the Streamlit session state bug where Add Task wasn't persisting, the AI suggested wrapping the Owner in a custom class. The actual fix was simpler - use st.session_state.owner directly for all writes instead of a local variable copy.
 
-- Task completion: mark_complete() sets completed to True
-- Recurrence: daily tasks create a next task for today + 1 day, weekly for +7 days, one-time tasks return None
-- Pet task management: adding and removing tasks changes the count correctly
-- Sorting: tasks are returned in chronological order
-- Conflict detection: flags duplicate times, returns empty list when all times are unique
-- Filtering: by pet name, completion status, and priority
-- Edge cases: empty owner with no pets, completing a task that does not exist
+**c. Limitations and future improvements**
 
-These tests matter because the scheduler is the core of the app. A bug in sorting or recurrence would give wrong information without any visible error.
+The advisor output is non-deterministic. The same schedule can produce slightly different recommendations on repeated runs. This makes it impossible to assert on specific wording in automated tests, so the eval harness checks structural properties instead.
 
-**b. Confidence**
+The conflict detection gap (duration-aware overlap) is the most significant known limitation. A 60-minute task at 09:00 and a task at 09:30 don't conflict in the current system.
 
-4 out of 5. The core logic is well covered. Given more time I would test invalid time formats, large task lists, and overlapping duration conflicts.
-
----
-
-## 5. Reflection
-
-**a. What went well**
-
-Keeping the logic in pawpal_system.py separate from the UI in app.py worked well. Because all the behavior lived in plain Python classes, the Streamlit code stayed simple and debugging was easier. I could run main.py in the terminal to test logic without the UI getting in the way.
-
-**b. What you would improve**
-
-I would add duration-aware conflict detection and some form of data persistence so the schedule is not lost when the browser refreshes.
-
-**c. Key takeaway**
-
-AI speeds things up but does not make design decisions for you. You still need to understand the problem well enough to evaluate what the AI produces and push back when it is wrong for the use case.
+If I had more time I would add duration-aware conflict detection, a proper authentication layer so data.json isn't world-readable, and a multi-turn advisor that lets the owner ask follow-up questions about specific recommendations.

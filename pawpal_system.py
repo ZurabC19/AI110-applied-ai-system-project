@@ -7,6 +7,8 @@ Contains the Owner, Pet, Task, and Scheduler classes.
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import List, Optional
+import json
+import os
 
 
 @dataclass
@@ -46,6 +48,31 @@ class Task:
             )
         return None
 
+    def to_dict(self) -> dict:
+        """Serialize task to a JSON-compatible dictionary."""
+        return {
+            "description": self.description,
+            "time": self.time,
+            "frequency": self.frequency,
+            "priority": self.priority,
+            "duration_minutes": self.duration_minutes,
+            "due_date": self.due_date.isoformat(),
+            "completed": self.completed,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Task":
+        """Deserialize a Task from a dictionary."""
+        return cls(
+            description=data["description"],
+            time=data["time"],
+            frequency=data["frequency"],
+            priority=data.get("priority", 2),
+            duration_minutes=data.get("duration_minutes", 30),
+            due_date=date.fromisoformat(data["due_date"]),
+            completed=data.get("completed", False),
+        )
+
     def __str__(self) -> str:
         status = "✅" if self.completed else "⏳"
         priority_label = {1: "High", 2: "Medium", 3: "Low"}.get(self.priority, "Medium")
@@ -81,6 +108,28 @@ class Pet:
         """Return only incomplete tasks."""
         return [t for t in self.tasks if not t.completed]
 
+    def to_dict(self) -> dict:
+        """Serialize pet to a JSON-compatible dictionary."""
+        return {
+            "name": self.name,
+            "species": self.species,
+            "breed": self.breed,
+            "age": self.age,
+            "tasks": [t.to_dict() for t in self.tasks],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Pet":
+        """Deserialize a Pet from a dictionary."""
+        pet = cls(
+            name=data["name"],
+            species=data["species"],
+            breed=data.get("breed", ""),
+            age=data.get("age", 0),
+        )
+        pet.tasks = [Task.from_dict(t) for t in data.get("tasks", [])]
+        return pet
+
     def __str__(self) -> str:
         return f"{self.name} ({self.species}{', ' + self.breed if self.breed else ''}, age {self.age})"
 
@@ -89,6 +138,7 @@ class Owner:
     """Represents the pet owner who manages one or more pets."""
 
     def __init__(self, name: str, email: str = ""):
+        """Initialize an Owner with a name and optional email."""
         self.name = name
         self.email = email
         self.pets: List[Pet] = []
@@ -113,6 +163,34 @@ class Owner:
                 result.append((pet.name, task))
         return result
 
+    def to_dict(self) -> dict:
+        """Serialize owner to a JSON-compatible dictionary."""
+        return {
+            "name": self.name,
+            "email": self.email,
+            "pets": [p.to_dict() for p in self.pets],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Owner":
+        """Deserialize an Owner from a dictionary."""
+        owner = cls(name=data["name"], email=data.get("email", ""))
+        owner.pets = [Pet.from_dict(p) for p in data.get("pets", [])]
+        return owner
+
+    def save_to_json(self, filepath: str = "data.json") -> None:
+        """Persist the owner's full data (pets + tasks) to a JSON file."""
+        with open(filepath, "w") as f:
+            json.dump(self.to_dict(), f, indent=2)
+
+    @classmethod
+    def load_from_json(cls, filepath: str = "data.json") -> Optional["Owner"]:
+        """Load an Owner from a JSON file. Returns None if file not found."""
+        if not os.path.exists(filepath):
+            return None
+        with open(filepath, "r") as f:
+            return cls.from_dict(json.load(f))
+
     def __str__(self) -> str:
         return f"Owner: {self.name} | Pets: {len(self.pets)}"
 
@@ -121,15 +199,24 @@ class Scheduler:
     """The brain of PawPal+. Sorts, filters, and validates tasks."""
 
     def __init__(self, owner: Owner):
+        """Initialize the Scheduler with an Owner instance."""
         self.owner = owner
 
     def get_all_tasks(self) -> List[tuple]:
         """Return all (pet_name, task) pairs from the owner."""
         return self.owner.get_all_tasks()
 
+    # ── Sorting ────────────────────────────────────────────────────────────
+
     def sort_by_time(self) -> List[tuple]:
-        """Return all tasks sorted chronologically, then by priority."""
+        """Return all tasks sorted chronologically, then by priority for ties."""
         return sorted(self.get_all_tasks(), key=lambda x: (x[1].time, x[1].priority))
+
+    def sort_by_priority(self) -> List[tuple]:
+        """Return all tasks sorted by priority first, then by time."""
+        return sorted(self.get_all_tasks(), key=lambda x: (x[1].priority, x[1].time))
+
+    # ── Filtering ──────────────────────────────────────────────────────────
 
     def filter_by_pet(self, pet_name: str) -> List[Task]:
         """Return all tasks for a specific pet."""
@@ -143,26 +230,36 @@ class Scheduler:
         return [(n, t) for n, t in self.get_all_tasks() if t.completed == completed]
 
     def filter_by_priority(self, priority: int) -> List[tuple]:
-        """Return tasks matching a specific priority level."""
+        """Return tasks matching a specific priority level (1=High, 2=Med, 3=Low)."""
         return [(n, t) for n, t in self.get_all_tasks() if t.priority == priority]
 
+    # ── Conflict Detection ─────────────────────────────────────────────────
+
     def detect_conflicts(self) -> List[str]:
-        """Detect tasks scheduled at the exact same time. Returns warning strings."""
-        seen = {}
-        warnings = []
+        """
+        Detect tasks scheduled at the exact same time.
+        Returns one warning per conflicting time slot (not one per duplicate pair).
+        Tradeoff: only checks exact HH:MM matches, not overlapping durations.
+        """
+        from collections import defaultdict
+        slots: dict = defaultdict(list)
         for pet_name, task in self.get_all_tasks():
-            if task.time in seen:
-                prev_pet, prev_desc = seen[task.time]
-                warnings.append(
-                    f"⚠️ Conflict at {task.time}: '{prev_desc}' ({prev_pet}) "
-                    f"and '{task.description}' ({pet_name})"
-                )
-            else:
-                seen[task.time] = (pet_name, task.description)
+            slots[task.time].append((pet_name, task.description))
+
+        warnings: List[str] = []
+        for time_slot, entries in sorted(slots.items()):
+            if len(entries) > 1:
+                names = ", ".join(f"'{desc}' ({pet})" for pet, desc in entries)
+                warnings.append(f"⚠️ Conflict at {time_slot}: {names}")
         return warnings
 
+    # ── Task Completion + Recurrence ───────────────────────────────────────
+
     def mark_task_complete(self, pet_name: str, task_description: str) -> str:
-        """Mark a task complete. Auto-schedules next occurrence if recurring."""
+        """
+        Mark a task complete. Auto-schedules next occurrence if recurring.
+        Returns a status message string.
+        """
         for pet in self.owner.pets:
             if pet.name.lower() == pet_name.lower():
                 for task in pet.tasks:
@@ -177,13 +274,46 @@ class Scheduler:
                         return f"✅ '{task.description}' marked complete (one-time task)."
         return f"❌ Task not found for {pet_name}."
 
+    # ── Next Available Slot (Stretch Feature) ──────────────────────────────
+
+    def next_available_slot(self, duration_minutes: int = 30) -> Optional[str]:
+        """
+        Find the next time slot (on the hour or half-hour, 07:00-21:00)
+        that has no existing task. Returns HH:MM string or None.
+        """
+        occupied = {task.time for _, task in self.get_all_tasks()}
+        for hour in range(7, 22):
+            for minute in (0, 30):
+                slot = f"{hour:02d}:{minute:02d}"
+                if slot not in occupied:
+                    return slot
+        return None
+
+    # ── Weighted Priority Score (Stretch Feature) ──────────────────────────
+
+    def weighted_priority_score(self, task: "Task") -> float:
+        """
+        Compute a composite urgency score. Lower = more urgent.
+        Formula: priority * 10 - duration_minutes * 0.1
+        """
+        return task.priority * 10 - task.duration_minutes * 0.1
+
+    def sort_by_weighted_priority(self) -> List[tuple]:
+        """Return tasks sorted by weighted priority score (most urgent first)."""
+        return sorted(
+            self.get_all_tasks(),
+            key=lambda x: (self.weighted_priority_score(x[1]), x[1].time),
+        )
+
+    # ── Daily Plan ─────────────────────────────────────────────────────────
+
     def generate_daily_plan(self) -> str:
         """Generate a formatted daily schedule with conflict warnings."""
         sorted_tasks = self.sort_by_time()
         conflicts = self.detect_conflicts()
-        lines = ["=" * 50, "🐾 PawPal+ Daily Schedule", "=" * 50]
+        lines = ["=" * 55, "🐾  PawPal+ Daily Schedule", "=" * 55]
         if not sorted_tasks:
-            lines.append("No tasks scheduled.")
+            lines.append("  No tasks scheduled.")
         else:
             for pet_name, task in sorted_tasks:
                 lines.append(f"  [{pet_name}] {task}")
@@ -192,5 +322,5 @@ class Scheduler:
             lines.append("⚠️  CONFLICTS DETECTED:")
             for w in conflicts:
                 lines.append(f"  {w}")
-        lines.append("=" * 50)
+        lines.append("=" * 55)
         return "\n".join(lines)
